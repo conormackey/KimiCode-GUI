@@ -446,6 +446,13 @@ pub async fn stream_chat(
         }
 
         if !content.is_empty() {
+            // Extract token usage from response if available
+            let usage = data.get("usage").cloned().unwrap_or(serde_json::json!({}));
+            let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64())
+                .unwrap_or(prompt_tokens + completion_tokens);
+            
             let _ = window.emit(
                 "chat://event",
                 StreamEvent {
@@ -462,6 +469,11 @@ pub async fn stream_chat(
                     event: "done".to_string(),
                     data: serde_json::json!({
                         "session_id": session_id,
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        },
                     }),
                 },
             );

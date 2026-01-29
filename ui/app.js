@@ -88,6 +88,8 @@
       settingDefaultModel: $('setting-default-model'),
       settingThinking: $('setting-thinking'),
       settingYolo: $('setting-yolo'),
+      settingApiKey: $('setting-api-key'),
+      settingApiBase: $('setting-api-base'),
       btnSaveSettings: $('btn-save-settings'),
       modelList: $('model-list'),
       skillsList: $('skills-list'),
@@ -223,6 +225,12 @@
         }
         break;
       case 'done':
+        // Track token usage if available
+        if (data?.usage && state.authMode === 'api_key') {
+          trackTokenUsage(data.usage);
+        }
+        finishStreaming();
+        break;
       case 'cancelled':
         finishStreaming();
         break;
@@ -374,6 +382,53 @@
     currentThinkingBuffer = '';
     hideLoading();
     enableInputs(true);
+  }
+
+  // Token usage tracking for API Key mode
+  function trackTokenUsage(usage) {
+    if (!state.tokenUsage) {
+      state.tokenUsage = {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      };
+    }
+    state.tokenUsage.prompt_tokens += usage.prompt_tokens || 0;
+    state.tokenUsage.completion_tokens += usage.completion_tokens || 0;
+    state.tokenUsage.total_tokens += usage.total_tokens || 0;
+    
+    // Update user bar to show token usage
+    if (state.authMode === 'api_key') {
+      updateUserBarWithTokens();
+    }
+  }
+  
+  function updateUserBarWithTokens() {
+    if (!state.isLoggedIn || state.authMode !== 'api_key' || !state.tokenUsage) return;
+    
+    elements.userStatus.innerHTML = '';
+    
+    // Token usage row
+    const tokenRow = document.createElement('div');
+    tokenRow.className = 'quota-row';
+    tokenRow.innerHTML = `
+      <div class="quota-header">
+        <span class="quota-label">Tokens Used</span>
+        <span class="quota-reset">Session</span>
+      </div>
+      <div class="quota-main">
+        <span class="quota-percent">${state.tokenUsage.total_tokens.toLocaleString()}</span>
+        <div style="font-size: 11px; color: var(--text-muted);">
+          ↑${state.tokenUsage.prompt_tokens.toLocaleString()} ↓${state.tokenUsage.completion_tokens.toLocaleString()}
+        </div>
+      </div>
+    `;
+    elements.userStatus.appendChild(tokenRow);
+    
+    const hint = document.createElement('div');
+    hint.className = 'user-status-hint';
+    hint.textContent = 'Click to logout';
+    elements.userStatus.appendChild(hint);
   }
 
   function createMessageElement(role, content) {
@@ -620,11 +675,25 @@
       const status = await invoke('auth_check_status');
       state.isLoggedIn = status.is_logged_in;
       state.authMode = status.mode; // 'oauth' | 'api_key' | 'none'
-      updateUserBar();
+      
+      // Load auth config for settings display
+      state.authConfig = await invoke('auth_get_config');
       
       if (state.isLoggedIn && status.mode === 'oauth') {
         await loadUserProfile();
+      } else if (state.isLoggedIn && status.mode === 'api_key') {
+        // Set a simple user object for API key mode
+        state.user = { 
+          mode: 'api_key',
+          total_label: 'API Key Mode',
+          total_percent: 0,
+          total_reset: '',
+          limit_label: 'Connected',
+          limit_percent: 0,
+          limit_reset: ''
+        };
       }
+      updateUserBar();
     } catch (err) {
       const message = err?.message || err || 'Failed to check auth status';
       showError(`Failed to check auth status: ${message}`);
@@ -985,35 +1054,49 @@
     if (state.isLoggedIn && state.user) {
       elements.userStatus.innerHTML = '';
       
-      // Weekly usage row
-      const totalRow = document.createElement('div');
-      totalRow.className = 'quota-row';
-      totalRow.innerHTML = `
-        <div class="quota-header">
-          <span class="quota-label">${state.user.total_label || 'Weekly usage'}</span>
-          <span class="quota-reset">${state.user.total_reset || ''}</span>
-        </div>
-        <div class="quota-main">
-          <span class="quota-percent">${Math.round(state.user.total_percent || 0)}%</span>
-          <div class="quota-bar"><div class="quota-fill" style="width: ${state.user.total_percent || 0}%"></div></div>
-        </div>
-      `;
-      elements.userStatus.appendChild(totalRow);
-      
-      // Rate limit row
-      const limitRow = document.createElement('div');
-      limitRow.className = 'quota-row';
-      limitRow.innerHTML = `
-        <div class="quota-header">
-          <span class="quota-label">${state.user.limit_label || 'Rate limit'}</span>
-          <span class="quota-reset">${state.user.limit_reset || ''}</span>
-        </div>
-        <div class="quota-main">
-          <span class="quota-percent">${Math.round(state.user.limit_percent || 0)}%</span>
-          <div class="quota-bar"><div class="quota-fill" style="width: ${state.user.limit_percent || 0}%"></div></div>
-        </div>
-      `;
-      elements.userStatus.appendChild(limitRow);
+      if (state.authMode === 'api_key') {
+        // API Key mode - show simple connected status
+        const apiKeyRow = document.createElement('div');
+        apiKeyRow.className = 'quota-row';
+        apiKeyRow.innerHTML = `
+          <div class="quota-header">
+            <span class="quota-label">API Key Mode</span>
+            <span class="quota-reset">Connected</span>
+          </div>
+        `;
+        elements.userStatus.appendChild(apiKeyRow);
+      } else {
+        // OAuth mode - show usage quotas
+        // Weekly usage row
+        const totalRow = document.createElement('div');
+        totalRow.className = 'quota-row';
+        totalRow.innerHTML = `
+          <div class="quota-header">
+            <span class="quota-label">${state.user.total_label || 'Weekly usage'}</span>
+            <span class="quota-reset">${state.user.total_reset || ''}</span>
+          </div>
+          <div class="quota-main">
+            <span class="quota-percent">${Math.round(state.user.total_percent || 0)}%</span>
+            <div class="quota-bar"><div class="quota-fill" style="width: ${state.user.total_percent || 0}%"></div></div>
+          </div>
+        `;
+        elements.userStatus.appendChild(totalRow);
+        
+        // Rate limit row
+        const limitRow = document.createElement('div');
+        limitRow.className = 'quota-row';
+        limitRow.innerHTML = `
+          <div class="quota-header">
+            <span class="quota-label">${state.user.limit_label || 'Rate limit'}</span>
+            <span class="quota-reset">${state.user.limit_reset || ''}</span>
+          </div>
+          <div class="quota-main">
+            <span class="quota-percent">${Math.round(state.user.limit_percent || 0)}%</span>
+            <div class="quota-bar"><div class="quota-fill" style="width: ${state.user.limit_percent || 0}%"></div></div>
+          </div>
+        `;
+        elements.userStatus.appendChild(limitRow);
+      }
       
       const hint = document.createElement('div');
       hint.className = 'user-status-hint';
@@ -1087,6 +1170,12 @@
     elements.settingSkills.value = state.settings.skills_dir || '';
     elements.settingThinking.checked = state.settings.thinking || false;
     elements.settingYolo.checked = state.settings.yolo || false;
+    
+    // Load auth config into settings
+    if (state.authConfig) {
+      elements.settingApiKey.value = state.authConfig.api_key || '';
+      elements.settingApiBase.value = state.authConfig.api_base || '';
+    }
     
     const workDir = state.settings.work_dir || state.paths?.work_dir;
     if (workDir) {
@@ -1184,9 +1273,9 @@
       state.isLoggedIn = true;
       state.authMode = 'api_key';
       closeLoginModal();
-      updateUserBar();
-      loadModels();
       showSuccess('Connected with API key');
+      // Reload to properly initialize the app with API key auth
+      location.reload();
     } catch (err) {
       showError('Failed to save API key: ' + err.message);
     }
@@ -1717,6 +1806,54 @@
       state.settings.skills_dir = elements.settingSkills.value || null;
       state.settings.model = elements.settingDefaultModel.value || null;
       state.settings.yolo = elements.settingYolo.checked;
+      
+      // Save auth config if provided
+      const apiKey = elements.settingApiKey.value?.trim();
+      const apiBase = elements.settingApiBase.value?.trim();
+      
+      if (apiKey) {
+        try {
+          await invoke('auth_set_api_key', { 
+            apiKey: apiKey,
+            apiBase: apiBase || null
+          });
+          // Update local state
+          state.authConfig = { mode: 'api_key', api_key: apiKey, api_base: apiBase };
+          state.isLoggedIn = true;
+          state.authMode = 'api_key';
+          state.user = { 
+            mode: 'api_key',
+            total_label: 'API Key Mode',
+            total_percent: 0,
+            total_reset: '',
+            limit_label: 'Connected',
+            limit_percent: 0,
+            limit_reset: ''
+          };
+          updateUserBar();
+          loadModels();
+        } catch (err) {
+          showError('Failed to save API key: ' + err.message);
+          return;
+        }
+      } else if (state.authConfig?.mode === 'api_key' && !apiKey) {
+        // API Key was cleared - clear auth
+        try {
+          await invoke('auth_clear');
+          state.isLoggedIn = false;
+          state.authMode = null;
+          state.user = null;
+          state.authConfig = { mode: 'oauth', api_key: null, api_base: null };
+          updateUserBar();
+          showSuccess('API Key cleared. Please login again.');
+          elements.drawerBackdrop.classList.remove('open');
+          // Show login modal
+          setTimeout(() => openLoginModal(), 500);
+          return;
+        } catch (err) {
+          showError('Failed to clear auth: ' + err.message);
+        }
+      }
       
       await invoke('gui_settings_save', { 
         path: null, 
