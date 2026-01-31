@@ -402,7 +402,7 @@ fn load_sessions(work_dir: &str) -> Result<Vec<SessionInfo>, String> {
 
     let empty_vec = Vec::new();
     let work_dirs = data.get("work_dirs").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
-    
+
     for wd in work_dirs {
         let path = wd.get("path").and_then(|v| v.as_str()).unwrap_or("");
         if path == work_dir {
@@ -416,30 +416,36 @@ fn load_sessions(work_dir: &str) -> Result<Vec<SessionInfo>, String> {
                     if !session_path.is_dir() {
                         continue;
                     }
-                    
+
                     let session_id = session_path.file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
-                    
-                    let context_file = session_path.join("context.jsonl");
+
                     let wire_file = session_path.join("wire.jsonl");
-                    
-                    if !context_file.exists() {
+
+                    // Only show sessions that have wire.jsonl with actual content
+                    if !wire_file.exists() {
                         continue;
                     }
-                    
-                    let updated_at = context_file.metadata()
+
+                    // Check if wire.jsonl has content (more than just metadata line)
+                    let wire_size = wire_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    if wire_size < 100 {
+                        continue;
+                    }
+
+                    let updated_at = wire_file.metadata()
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0);
-                    
+
                     let title = extract_session_title(&wire_file).unwrap_or_else(|| {
                         format!("Session {}", &session_id[..8.min(session_id.len())])
                     });
-                    
+
                     sessions.push(SessionInfo {
                         id: session_id,
                         title,
@@ -448,7 +454,7 @@ fn load_sessions(work_dir: &str) -> Result<Vec<SessionInfo>, String> {
                     });
                 }
             }
-            
+
             sessions.sort_by(|a, b| b.updated_at.partial_cmp(&a.updated_at).unwrap());
             return Ok(sessions);
         }
@@ -458,12 +464,11 @@ fn load_sessions(work_dir: &str) -> Result<Vec<SessionInfo>, String> {
 }
 
 fn get_session_dir(work_dir: &str, kaos: &str) -> Result<PathBuf, String> {
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
-    
-    let mut hasher = DefaultHasher::new();
-    work_dir.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
+    use md5::{Md5, Digest};
+
+    let mut hasher = Md5::new();
+    hasher.update(work_dir.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
     
     let dir_name = if kaos == "local" {
         hash
@@ -479,20 +484,34 @@ fn extract_session_title(wire_file: &Path) -> Option<String> {
     if !wire_file.exists() {
         return None;
     }
-    
+
     let content = fs::read_to_string(wire_file).ok()?;
-    
+
     for line in content.lines().take(50) {
         if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-            if record.get("type").and_then(|v| v.as_str()) == Some("turn_begin") {
-                if let Some(input) = record.get("user_input").and_then(|v| v.as_str()) {
-                    let title = truncate_with_ellipsis(input, 50);
-                    return Some(title);
+            // Handle nested message format: {"message": {"type": "TurnBegin", "payload": {"user_input": [...]}}}
+            let msg_type = record.get("message")
+                .and_then(|m| m.get("type"))
+                .and_then(|v| v.as_str());
+
+            if msg_type == Some("TurnBegin") {
+                // user_input is an array of objects with "type" and "text" fields
+                if let Some(user_input) = record.get("message")
+                    .and_then(|m| m.get("payload"))
+                    .and_then(|p| p.get("user_input"))
+                    .and_then(|u| u.as_array())
+                {
+                    for input_item in user_input {
+                        if let Some(text) = input_item.get("text").and_then(|t| t.as_str()) {
+                            let title = truncate_with_ellipsis(text, 50);
+                            return Some(title);
+                        }
+                    }
                 }
             }
         }
     }
-    
+
     None
 }
 
@@ -513,9 +532,15 @@ fn app_info() -> AppInfo {
 
 #[tauri::command]
 fn app_paths() -> AppPaths {
-    let work_dir = find_repo_root().unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    // Check for KIMI_GUI_WORK_DIR env var first, then PWD (original shell cwd), then find_repo_root, then current_dir
+    let work_dir = std::env::var("KIMI_GUI_WORK_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("PWD").ok().map(PathBuf::from))
+        .or_else(|| find_repo_root())
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
 
     AppPaths {
         config: default_config_path().to_string_lossy().to_string(),

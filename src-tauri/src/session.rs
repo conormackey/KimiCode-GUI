@@ -221,26 +221,32 @@ impl SessionManager {
     pub fn load_messages(&self, work_dir: &str, session_id: &str) -> Result<Vec<Message>, String> {
         let session_dir = self.get_session_dir(work_dir, session_id)?;
         let wire_file = session_dir.join("wire.jsonl");
-        
+
         if !wire_file.exists() {
             return Ok(Vec::new());
         }
-        
+
         let content = fs::read_to_string(&wire_file)
             .map_err(|e| format!("Failed to read wire file: {}", e))?;
-        
+
         let mut messages = Vec::new();
         let mut current_content = String::new();
         let mut current_role: Option<String> = None;
-        
+
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            
+
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                match record.get("type").and_then(|v| v.as_str()) {
-                    Some("turn_begin") => {
+                // Handle nested message format: {"message": {"type": "...", "payload": {...}}}
+                let msg_type = record.get("message")
+                    .and_then(|m| m.get("type"))
+                    .and_then(|v| v.as_str());
+
+                match msg_type {
+                    Some("TurnBegin") => {
+                        // Flush any previous assistant content
                         if let Some(role) = &current_role {
                             if !current_content.is_empty() {
                                 messages.push(Message {
@@ -251,35 +257,55 @@ impl SessionManager {
                                 });
                             }
                         }
-                        
-                        // User message
-                        current_content = record.get("user_input")
-                            .and_then(|v| v.as_str())
+
+                        // Extract user message from payload.user_input array
+                        let user_text = record.get("message")
+                            .and_then(|m| m.get("payload"))
+                            .and_then(|p| p.get("user_input"))
+                            .and_then(|u| u.as_array())
+                            .and_then(|arr| {
+                                arr.iter()
+                                    .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+                            })
                             .unwrap_or("")
                             .to_string();
-                        
-                        messages.push(Message {
-                            role: "user".to_string(),
-                            content: current_content.clone(),
-                            timestamp: chrono::Utc::now().timestamp(),
-                            tool_calls: None,
-                        });
-                        
+
+                        if !user_text.is_empty() {
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: user_text,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                tool_calls: None,
+                            });
+                        }
+
                         // Switch to assistant for subsequent content
                         current_role = Some("assistant".to_string());
                         current_content = String::new();
                     }
-                    Some("text_part") => {
+                    Some("ContentPart") => {
                         if current_role.as_deref() == Some("assistant") {
-                            if let Some(content) = record.get("content").and_then(|v| v.as_str()) {
-                                current_content.push_str(content);
+                            // Check payload.type to see if it's "text" (not "think" or other types)
+                            let part_type = record.get("message")
+                                .and_then(|m| m.get("payload"))
+                                .and_then(|p| p.get("type"))
+                                .and_then(|t| t.as_str());
+
+                            if part_type == Some("text") {
+                                if let Some(text) = record.get("message")
+                                    .and_then(|m| m.get("payload"))
+                                    .and_then(|p| p.get("text"))
+                                    .and_then(|t| t.as_str())
+                                {
+                                    current_content.push_str(text);
+                                }
                             }
                         }
                     }
-                    Some("tool_call") => {
+                    Some("ToolCall") => {
                         // Handle tool calls if present
                     }
-                    Some("step_end") | Some("turn_end") => {
+                    Some("StepEnd") | Some("TurnEnd") => {
                         if let Some(role) = &current_role {
                             if role == "assistant" && !current_content.is_empty() {
                                 messages.push(Message {
@@ -296,7 +322,7 @@ impl SessionManager {
                 }
             }
         }
-        
+
         // Flush any remaining assistant content
         if current_role.as_deref() == Some("assistant") && !current_content.is_empty() {
             messages.push(Message {
@@ -306,17 +332,16 @@ impl SessionManager {
                 tool_calls: None,
             });
         }
-        
+
         Ok(messages)
     }
     
     fn get_session_dir(&self, work_dir: &str, session_id: &str) -> Result<PathBuf, String> {
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        
-        let mut hasher = DefaultHasher::new();
-        work_dir.hash(&mut hasher);
-        let hash = format!("{:016x}", hasher.finish());
+        use md5::{Md5, Digest};
+
+        let mut hasher = Md5::new();
+        hasher.update(work_dir.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
         
         let share_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
